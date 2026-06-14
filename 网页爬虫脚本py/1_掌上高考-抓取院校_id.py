@@ -3,7 +3,6 @@ from datetime import date
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_utils import launch_browser, wait_for_manual_login
-import pandas as pd
 import os
 import time
 import random
@@ -14,6 +13,8 @@ SCHOOL_NAME_SELECTOR = "div.school-tab_name__3pOZK"
 PAGE_LOADED_SELECTOR = ".main-nav_logo2__bmYaw"
 HOME_URL = "https://www.gaokao.cn"
 CSV_HEADER = ["院校名称", "代码", "状态", "错误信息", "日期"]
+CSV_READ_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "gb18030")
+CSV_WRITE_ENCODING = "utf-8-sig"
 DONE_STATUSES = frozenset({"成功", "无效"})
 FRESH_MONTHS = 6
 
@@ -21,12 +22,22 @@ FRESH_MONTHS = 6
 ENABLE_DATE_SKIP = False
 
 
+def read_csv_rows(file_path):
+    last_err = None
+    for encoding in CSV_READ_ENCODINGS:
+        try:
+            with open(file_path, newline="", encoding=encoding) as csvfile:
+                return list(csv.reader(csvfile))
+        except UnicodeDecodeError as err:
+            last_err = err
+    raise last_err
+
+
 class UniversityScraper:
     def __init__(
         self,
         num_urls,
         save_csv_path,
-        save_excel_path,
         base_dir,
     ):
         self.num_urls = num_urls
@@ -35,7 +46,6 @@ class UniversityScraper:
         self.playwright = None
         self.records = {}
         self.save_csv_path = save_csv_path
-        self.save_excel_path = save_excel_path
         self.base_dir = base_dir
 
         self._load_existing_results()
@@ -106,16 +116,9 @@ class UniversityScraper:
 
     def _load_existing_results(self):
         if os.path.exists(self.save_csv_path):
-            with open(self.save_csv_path, newline="", encoding="utf-8-sig") as csvfile:
-                self._load_rows_into_records(list(csv.reader(csvfile)))
-        elif os.path.exists(self.save_excel_path):
-            df = pd.read_excel(self.save_excel_path)
-            rows = df.fillna("").astype(str).values.tolist()
-            self._load_rows_into_records(rows)
-            self._flush_csv()
-            print("Excel 文件已转化为 CSV 文件")
+            self._load_rows_into_records(read_csv_rows(self.save_csv_path))
         else:
-            print("未找到已存在的结果文件，从头开始")
+            print("未找到已存在的结果 CSV，从头开始")
 
         pending_count = sum(
             1 for school_id in range(1, self.num_urls + 1) if self._should_process(school_id)
@@ -160,7 +163,9 @@ class UniversityScraper:
         self._flush_csv()
 
     def _flush_csv(self):
-        with open(self.save_csv_path, "w", newline="", encoding="utf-8-sig") as csvfile:
+        with open(
+            self.save_csv_path, "w", newline="", encoding=CSV_WRITE_ENCODING
+        ) as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(CSV_HEADER)
 
@@ -252,13 +257,11 @@ class UniversityScraper:
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     num_urls = 4000
-    save_csv_path = os.path.join(current_dir, "高考教育院校id_map_表.csv")
-    save_excel_path = os.path.join(current_dir, "高考教育院校id_map_表.xlsx")
+    save_csv_path = os.path.join(current_dir, "掌上高考-id_院校_map表.csv")
 
     scraper = UniversityScraper(
         num_urls,
         save_csv_path,
-        save_excel_path,
         current_dir,
     )
     scraper.scrape()
