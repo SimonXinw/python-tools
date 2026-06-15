@@ -13,14 +13,14 @@ from playwright.async_api import (
 )
 
 # 爬取目标（修改此处即可切换省份/年份）
-TARGET_PROVINCE = "浙江"
+TARGET_PROVINCE = "安徽"
 TARGET_YEAR = "2025"
 TARGET_BATCH = "本科批"
 TARGET_GENRE = "首选物理"
 
 # 并发开关：True 时启用多标签页并发；False 时单标签页顺序执行
 ENABLE_CONCURRENT = True
-CONCURRENT_WORKERS = 16
+CONCURRENT_WORKERS = 8
 
 # 状态表落盘：内存更新后由后台定时批量写入，降低 Windows 下 os.replace 冲突
 STATUS_FLUSH_INTERVAL_SEC = 1.0
