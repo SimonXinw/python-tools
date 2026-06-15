@@ -35,6 +35,10 @@ RESULT_COLUMNS = [
     "查询院校ID",
     "查询院校名称",
     "页面院校名称",
+    "页面所在地",
+    "性质",
+    "类型",
+    "主管部门",
     "省份",
     "批次",
     "科类",
@@ -57,9 +61,27 @@ SKIP_STATUSES = {
 }
 
 SCORELINE_SELECTOR = "#scoreline"
+SCHOOL_INFO_SELECTOR = ".school-tab_info__3x6H6"
 SCHOOL_NAME_SELECTOR = ".school-tab_name__3pOZK"
-TABLE_ROW_SELECTOR = f"{SCORELINE_SELECTOR} table.tb-normal tbody tr"
-FILTER_VALUE_SELECTOR = f"{SCORELINE_SELECTOR} .ant-select-selection-selected-value"
+SCHOOL_ADDRESS_SELECTOR = ".school-tab_adress__1WWI_"
+SCHOOL_CORE_TAGS_SELECTOR = ".school-tab_coreTags__31I0N span"
+SCHOOL_PROFILE_TIMEOUT_MS = 8000
+NATURE_KEYWORDS = frozenset({"公办", "民办"})
+SCHOOL_TYPE_KEYWORDS = frozenset(
+    {"综合", "理工", "师范", "财经", "农林", "医药", "艺术", "体育", "军事", "语言"}
+)
+TABLE_ROW_SELECTOR = "table.tb-normal tbody tr"
+PAGINATION_BOX_SELECTOR = ".pagination_box"
+PAGINATION_NEXT_SELECTOR = ".ant-pagination-next:not(.ant-pagination-disabled)"
+PAGINATION_ITEM_SELECTOR = ".ant-pagination-item"
+MAX_PAGINATION_PAGES = 200
+FILTER_BAR_SELECTORS = (
+    ".slt-drop.flex-fsx",
+    ".slt-drop",
+    ":scope",
+)
+FILTER_VALUE_SELECTOR = ".ant-select-selection-selected-value"
+FILTER_FIELD_ORDER = ("省份", "年份", "科类", "批次")
 
 SCORELINE_READY_TIMEOUT_MS = 20000
 TABLE_READY_TIMEOUT_MS = 10000
@@ -68,8 +90,44 @@ FILTER_VALUE_POLL_INTERVAL = 0.2
 PAGE_CHANGE_TIMEOUT_MS = 8000
 PAGE_CHANGE_DEBOUNCE_SEC = 0.3
 NO_DATA_SETTLE_SEC = 0.15
+NO_ENROLLMENT_MIN_BOX_SIZE = 50
+NO_ENROLLMENT_SELECTORS = (
+    ".nodata_nodata__1Ey7Y.show",
+    "[class*='nodata_nodata'].show",
+    ".nodata_nodata__1Ey7Y",
+)
+NO_ENROLLMENT_TEXT_SELECTORS = (
+    ".nodata_customText__3jJyM",
+    "[class*='nodata_customText']",
+)
+DEFAULT_NO_ENROLLMENT_TEXT = "当前地区学校暂未招生或分数未公布"
 
-ID_COLUMN_CANDIDATES = ("代码", "id", "ID")
+BLOCKING_MODAL_WRAP_SELECTOR = ".ant-modal-wrap"
+MODAL_DISMISS_TIMEOUT_MS = 3000
+MODAL_DISMISS_POLL_INTERVAL = 0.15
+BLOCKING_MODAL_RULES = (
+    {
+        "name": "会员推荐弹窗",
+        "wrap_selector": ".ant-modal-wrap",
+        "body_selector": ".activate-member_activateMember__3Aock",
+        "close_selector": ".activate-member_close__DskC5, .icon_close",
+    },
+    {
+        "name": "会员推荐弹窗(直连)",
+        "wrap_selector": "",
+        "body_selector": ".activate-member_activateMember__3Aock",
+        "close_selector": ".activate-member_close__DskC5, .icon_close",
+    },
+    {
+        "name": "VIP解锁弹窗",
+        "wrap_selector": BLOCKING_MODAL_WRAP_SELECTOR,
+        "body_selector": ".main-nav_openVipOpModalBox__1My1E",
+        "close_selector": ".icon_close",
+    },
+)
+
+ID_COLUMN_CANDIDATES = ("id", "ID", "代码")
+SCHOOL_NAME_COLUMN_CANDIDATES = ("学校名称", "院校名称")
 
 
 def read_csv_with_encodings(file_path):
@@ -103,6 +161,15 @@ def resolve_id_column(columns):
             return column_name
     raise KeyError(
         f"状态表缺少院校 ID 列，需要以下之一: {', '.join(ID_COLUMN_CANDIDATES)}"
+    )
+
+
+def resolve_school_name_column(columns):
+    for column_name in SCHOOL_NAME_COLUMN_CANDIDATES:
+        if column_name in columns:
+            return column_name
+    raise KeyError(
+        f"状态表缺少院校名称列，需要以下之一: {', '.join(SCHOOL_NAME_COLUMN_CANDIDATES)}"
     )
 
 
@@ -144,9 +211,11 @@ class GaokaoScorelineScraper:
 
         self.df = None
         self.id_column = None
-        self._save_lock = threading.Lock()
-        self._status_dirty = False
+        self.school_name_column = None
+        self._status_lock = threading.Lock()
+        self._result_lock = threading.Lock()
         self._progress_lock = threading.Lock()
+        self._status_dirty = False
         self._total_schools = 0
         self._total_pending = 0
         self._skip_count = 0
@@ -189,7 +258,7 @@ class GaokaoScorelineScraper:
         )
 
     def _flush_status_to_disk(self):
-        with self._save_lock:
+        with self._status_lock:
             if not self._status_dirty:
                 return False
             self._save_status_dataframe()
@@ -201,7 +270,7 @@ class GaokaoScorelineScraper:
             try:
                 self._flush_status_to_disk()
             except PermissionError as err:
-                with self._save_lock:
+                with self._status_lock:
                     self._status_dirty = True
                 print(f"【警告】状态表落盘失败，将在下次定时重试: {err}")
 
@@ -212,7 +281,7 @@ class GaokaoScorelineScraper:
         try:
             self._flush_status_to_disk()
         except PermissionError as err:
-            with self._save_lock:
+            with self._status_lock:
                 self._status_dirty = True
             print(f"【警告】退出前状态表落盘失败: {err}")
 
@@ -236,6 +305,7 @@ class GaokaoScorelineScraper:
     def _init_source_table(self):
         self.df = self._load_status_dataframe()
         self.id_column = resolve_id_column(self.df.columns)
+        self.school_name_column = resolve_school_name_column(self.df.columns)
 
         if "状态" not in self.df.columns:
             self.df["状态"] = ""
@@ -267,7 +337,66 @@ class GaokaoScorelineScraper:
         row = self.df.loc[row_index]
         return {
             "school_id": self._normalize_cell_value(row.get(self.id_column, "")),
-            "school_name": self._normalize_cell_value(row.get("院校名称", "")),
+            "school_name": self._normalize_cell_value(
+                row.get(self.school_name_column, "")
+            ),
+            "source_nature": self._normalize_cell_value(row.get("性质", "")),
+            "source_type": self._normalize_cell_value(row.get("类型", "")),
+            "source_department": self._normalize_cell_value(
+                row.get("主管部门", "")
+            ),
+        }
+
+    @staticmethod
+    def _is_school_type_tag(tag):
+        if tag.endswith("类"):
+            return True
+        return tag in SCHOOL_TYPE_KEYWORDS
+
+    @classmethod
+    def _parse_page_core_tags(cls, core_tags):
+        nature = ""
+        school_type = ""
+        affiliations = []
+
+        for raw_tag in core_tags:
+            tag = str(raw_tag or "").strip()
+            if not tag:
+                continue
+            if tag in NATURE_KEYWORDS and not nature:
+                nature = tag
+                continue
+            if cls._is_school_type_tag(tag) and not school_type:
+                school_type = tag
+                continue
+            affiliations.append(tag)
+
+        return {
+            "nature": nature,
+            "school_type": school_type,
+            "department": "、".join(affiliations),
+        }
+
+    @staticmethod
+    def _merge_profile_field(page_value, source_value):
+        page_text = str(page_value or "").strip()
+        source_text = str(source_value or "").strip()
+        return page_text or source_text
+
+    def _merge_school_profile(self, page_profile, school_meta):
+        parsed_core = page_profile.get("parsed_core", {})
+        return {
+            "page_school_name": page_profile.get("name", ""),
+            "page_address": page_profile.get("address", ""),
+            "nature": self._merge_profile_field(
+                parsed_core.get("nature"), school_meta.get("source_nature")
+            ),
+            "school_type": self._merge_profile_field(
+                parsed_core.get("school_type"), school_meta.get("source_type")
+            ),
+            "department": self._merge_profile_field(
+                parsed_core.get("department"), school_meta.get("source_department")
+            ),
         }
 
     def _create_empty_result_file(self):
@@ -340,7 +469,7 @@ class GaokaoScorelineScraper:
         return f"https://www.gaokao.cn/school/{school_id}/provinceline"
 
     def _save_status(self, row_index, status, error_message=""):
-        with self._save_lock:
+        with self._status_lock:
             self.df.at[row_index, "状态"] = status
             if error_message:
                 self.df.at[row_index, "错误信息"] = error_message
@@ -351,7 +480,7 @@ class GaokaoScorelineScraper:
         if not rows_data:
             return
 
-        with self._save_lock:
+        with self._result_lock:
             last_err = None
             for attempt in range(FILE_WRITE_MAX_RETRIES):
                 try:
@@ -424,19 +553,125 @@ class GaokaoScorelineScraper:
                 return False, key, expected, actual
         return True, "", "", ""
 
+    async def _try_dismiss_modal_rule(
+        self, page, rule, school_label="", worker_id=0
+    ):
+        label_suffix = f" [{school_label}]" if school_label else ""
+        body_selector = rule.get("body_selector", "")
+        wrap_selector = rule.get("wrap_selector", "")
+        close_selector = rule.get("close_selector", "")
+
+        if body_selector and wrap_selector:
+            modal_root = page.locator(wrap_selector).filter(
+                has=page.locator(body_selector)
+            ).first
+        elif body_selector:
+            modal_root = page.locator(body_selector).first
+        elif wrap_selector:
+            modal_root = page.locator(wrap_selector).first
+        else:
+            return False
+
+        try:
+            if await modal_root.count() == 0 or not await modal_root.is_visible():
+                return False
+        except Exception:
+            return False
+
+        close_btn = (
+            modal_root.locator(close_selector).first
+            if close_selector
+            else modal_root
+        )
+        try:
+            if await close_btn.count() == 0 or not await close_btn.is_visible():
+                return False
+            await close_btn.click(timeout=2000)
+            try:
+                await modal_root.wait_for(
+                    state="hidden", timeout=MODAL_DISMISS_TIMEOUT_MS
+                )
+            except PlaywrightTimeoutError:
+                if body_selector:
+                    body_locator = page.locator(body_selector).first
+                    if await body_locator.count() > 0:
+                        await body_locator.wait_for(
+                            state="hidden", timeout=MODAL_DISMISS_TIMEOUT_MS
+                        )
+            print(
+                f"[W{worker_id}] 【弹窗】已关闭{rule['name']}{label_suffix}"
+            )
+            await asyncio.sleep(MODAL_DISMISS_POLL_INTERVAL)
+            return True
+        except Exception as err:
+            print(
+                f"[W{worker_id}] 【弹窗】关闭{rule['name']}失败"
+                f"{label_suffix}: {err}"
+            )
+            return False
+
+    async def _dismiss_blocking_modals(self, page, school_label="", worker_id=0):
+        """关闭会员推荐、VIP 解锁等遮挡操作的弹窗，返回本轮是否关闭过弹窗。"""
+        if page is None:
+            return False
+
+        dismissed_any = False
+
+        for _ in range(3):
+            dismissed_this_round = False
+
+            for rule in BLOCKING_MODAL_RULES:
+                if await self._try_dismiss_modal_rule(
+                    page, rule, school_label, worker_id
+                ):
+                    dismissed_any = True
+                    dismissed_this_round = True
+                    break
+
+            if not dismissed_this_round:
+                break
+
+        return dismissed_any
+
+    async def _resolve_filter_bar(self, scoreline):
+        for selector in FILTER_BAR_SELECTORS:
+            filter_bar = scoreline.locator(selector).first
+            try:
+                if await filter_bar.count() == 0 or not await filter_bar.is_visible():
+                    continue
+                value_count = await filter_bar.locator(FILTER_VALUE_SELECTOR).count()
+                if value_count >= len(FILTER_FIELD_ORDER):
+                    return filter_bar
+                if value_count > 0:
+                    return filter_bar
+            except Exception:
+                continue
+
+        return scoreline
+
+    async def _read_filter_value_text(self, value_locator):
+        title = await value_locator.get_attribute("title")
+        if title and str(title).strip():
+            return str(title).strip()
+        return (await value_locator.inner_text()).strip()
+
     async def _get_scoreline_filters(self, scoreline):
-        values = scoreline.locator(FILTER_VALUE_SELECTOR)
+        filter_bar = await self._resolve_filter_bar(scoreline)
+        values = filter_bar.locator(FILTER_VALUE_SELECTOR)
         count = await values.count()
         texts = []
-        for index in range(min(count, 4)):
-            texts.append((await values.nth(index).inner_text()).strip())
+        for index in range(min(count, len(FILTER_FIELD_ORDER))):
+            texts.append(await self._read_filter_value_text(values.nth(index)))
 
         return {
-            "省份": texts[0] if len(texts) > 0 else "",
-            "年份": texts[1] if len(texts) > 1 else "",
-            "科类": texts[2] if len(texts) > 2 else "",
-            "批次": texts[3] if len(texts) > 3 else "",
+            field_name: texts[index] if index < len(texts) else ""
+            for index, field_name in enumerate(FILTER_FIELD_ORDER)
         }
+
+    async def _get_filter_value_locator(self, scoreline, field_name):
+        field_index = FILTER_FIELD_ORDER.index(field_name)
+        filter_bar = await self._resolve_filter_bar(scoreline)
+        return filter_bar.locator(FILTER_VALUE_SELECTOR).nth(field_index)
 
     async def _get_table_fingerprint(self, scoreline):
         return await scoreline.locator("table.tb-normal tbody").first.evaluate(
@@ -456,6 +691,54 @@ class GaokaoScorelineScraper:
     async def _has_table_rows(self, scoreline):
         return await scoreline.locator(TABLE_ROW_SELECTOR).count() > 0
 
+    async def _detect_no_enrollment_state(self, scoreline):
+        for selector in NO_ENROLLMENT_SELECTORS:
+            nodata = scoreline.locator(selector).first
+            try:
+                if await nodata.count() == 0 or not await nodata.is_visible():
+                    continue
+
+                box = await nodata.bounding_box()
+                if not box:
+                    continue
+                if (
+                    box.get("width", 0) <= NO_ENROLLMENT_MIN_BOX_SIZE
+                    or box.get("height", 0) <= NO_ENROLLMENT_MIN_BOX_SIZE
+                ):
+                    continue
+
+                message = DEFAULT_NO_ENROLLMENT_TEXT
+                for text_selector in NO_ENROLLMENT_TEXT_SELECTORS:
+                    text_locator = nodata.locator(text_selector).first
+                    if await text_locator.count() == 0:
+                        continue
+                    text = (await text_locator.inner_text()).strip()
+                    if text:
+                        message = text
+                        break
+
+                return True, message
+            except Exception:
+                continue
+
+        return False, ""
+
+    async def _wait_for_scoreline_content(self, scoreline):
+        deadline = time.monotonic() + TABLE_READY_TIMEOUT_MS / 1000
+        while time.monotonic() < deadline:
+            if await self._has_table_rows(scoreline):
+                return "has_rows", ""
+
+            is_no_enrollment, message = await self._detect_no_enrollment_state(
+                scoreline
+            )
+            if is_no_enrollment:
+                return "no_enrollment", message
+
+            await asyncio.sleep(NO_DATA_SETTLE_SEC)
+
+        return "timeout", ""
+
     async def _wait_for_scoreline_ready(self, page, school_label, worker_id):
         try:
             await page.wait_for_selector(
@@ -473,31 +756,67 @@ class GaokaoScorelineScraper:
                 f"[W{worker_id}] 【失败】专业分数线模块不可见: {school_label}"
             )
             return None
+
+        filter_bar = await self._resolve_filter_bar(scoreline)
+        try:
+            await filter_bar.wait_for(state="visible", timeout=5000)
+        except PlaywrightTimeoutError:
+            is_no_enrollment, message = await self._detect_no_enrollment_state(
+                scoreline
+            )
+            if is_no_enrollment:
+                print(
+                    f"[W{worker_id}] 【提示】未显示筛选栏，但检测到未招生："
+                    f"{message} [{school_label}]"
+                )
+                return scoreline
+
+            print(
+                f"[W{worker_id}] 【失败】专业分数线筛选栏未出现: {school_label}"
+            )
+            return None
+
         return scoreline
 
     async def _wait_for_filter_value(
-        self, scoreline, field_name, expected_value, school_label
+        self, page, scoreline, field_name, expected_value, school_label, worker_id=0
     ):
-        field_index = {
-            "省份": 0,
-            "年份": 1,
-            "科类": 2,
-            "批次": 3,
-        }.get(field_name)
-
-        if field_index is None:
+        if field_name not in FILTER_FIELD_ORDER:
             return False, "load", f"未知筛选字段 {field_name}", {}
 
-        value_locator = scoreline.locator(FILTER_VALUE_SELECTOR).nth(field_index)
+        value_locator = await self._get_filter_value_locator(scoreline, field_name)
 
+        visible = False
         try:
             await value_locator.wait_for(state="visible", timeout=5000)
+            visible = True
         except PlaywrightTimeoutError:
+            if await self._dismiss_blocking_modals(page, school_label, worker_id):
+                try:
+                    await value_locator.wait_for(state="visible", timeout=5000)
+                    visible = True
+                except PlaywrightTimeoutError:
+                    pass
+
+        if not visible:
+            is_no_enrollment, message = await self._detect_no_enrollment_state(
+                scoreline
+            )
+            if is_no_enrollment:
+                filters = await self._get_scoreline_filters(scoreline)
+                self._log_filters(
+                    filters, f"已显示未招生空状态({message})", school_label
+                )
+                return True, "", "", filters
+
             filters = await self._get_scoreline_filters(scoreline)
             self._log_filters(filters, f"{field_name}筛选框未出现", school_label)
             return False, "load", f"{field_name}筛选框未出现", filters
 
-        for _ in range(FILTER_VALUE_POLL_COUNT):
+        for poll_index in range(FILTER_VALUE_POLL_COUNT):
+            if poll_index % 5 == 0:
+                await self._dismiss_blocking_modals(page, school_label, worker_id)
+
             filters = await self._get_scoreline_filters(scoreline)
             actual = str(filters.get(field_name, "")).strip()
             if actual == expected_value:
@@ -507,6 +826,13 @@ class GaokaoScorelineScraper:
             if await self._has_table_rows(scoreline):
                 self._log_filters(
                     filters, f"{field_name}未就绪但列表已有数据", school_label
+                )
+                return True, "", "", filters
+
+            is_no_enrollment, _ = await self._detect_no_enrollment_state(scoreline)
+            if is_no_enrollment:
+                self._log_filters(
+                    filters, f"{field_name}未就绪但已显示未招生", school_label
                 )
                 return True, "", "", filters
 
@@ -524,6 +850,13 @@ class GaokaoScorelineScraper:
             )
             return True, "", "", filters
 
+        is_no_enrollment, message = await self._detect_no_enrollment_state(scoreline)
+        if is_no_enrollment:
+            self._log_filters(
+                filters, f"超时但已显示未招生({message})", school_label
+            )
+            return True, "", "", filters
+
         if actual and actual != expected_value:
             self._log_filters(filters, f"{field_name}无效", school_label)
             return False, "invalid", f"{field_name}={actual}", filters
@@ -531,92 +864,203 @@ class GaokaoScorelineScraper:
         self._log_filters(filters, f"{field_name}值未就绪", school_label)
         return False, "load", f"{field_name}值未就绪", filters
 
-    async def _wait_for_filter_has_value(self, scoreline, field_name, school_label):
-        field_index = {"批次": 3, "科类": 2}.get(field_name)
-        if field_index is None:
+    async def _wait_for_filter_has_value(
+        self, page, scoreline, field_name, school_label, worker_id=0
+    ):
+        if field_name not in FILTER_FIELD_ORDER:
             return False, "load", f"未知筛选字段 {field_name}", {}
 
-        value_locator = scoreline.locator(FILTER_VALUE_SELECTOR).nth(field_index)
+        value_locator = await self._get_filter_value_locator(scoreline, field_name)
+
+        visible = False
         try:
             await value_locator.wait_for(state="visible", timeout=5000)
+            visible = True
         except PlaywrightTimeoutError:
+            if await self._dismiss_blocking_modals(page, school_label, worker_id):
+                try:
+                    await value_locator.wait_for(state="visible", timeout=5000)
+                    visible = True
+                except PlaywrightTimeoutError:
+                    pass
+
+        if not visible:
+            is_no_enrollment, message = await self._detect_no_enrollment_state(
+                scoreline
+            )
+            if is_no_enrollment:
+                filters = await self._get_scoreline_filters(scoreline)
+                self._log_filters(
+                    filters, f"已显示未招生空状态({message})", school_label
+                )
+                return True, "", "", filters
+
             filters = await self._get_scoreline_filters(scoreline)
             self._log_filters(filters, f"{field_name}筛选框未出现", school_label)
             return False, "load", f"{field_name}筛选框未出现", filters
 
-        for _ in range(FILTER_VALUE_POLL_COUNT):
+        for poll_index in range(FILTER_VALUE_POLL_COUNT):
+            if poll_index % 5 == 0:
+                await self._dismiss_blocking_modals(page, school_label, worker_id)
+
             filters = await self._get_scoreline_filters(scoreline)
             actual = str(filters.get(field_name, "")).strip()
             if actual:
                 self._log_filters(filters, f"{field_name}有值", school_label)
                 return True, "", "", filters
+
+            is_no_enrollment, _ = await self._detect_no_enrollment_state(scoreline)
+            if is_no_enrollment:
+                self._log_filters(
+                    filters, f"{field_name}未就绪但已显示未招生", school_label
+                )
+                return True, "", "", filters
+
             await asyncio.sleep(FILTER_VALUE_POLL_INTERVAL)
 
         filters = await self._get_scoreline_filters(scoreline)
+        is_no_enrollment, message = await self._detect_no_enrollment_state(scoreline)
+        if is_no_enrollment:
+            self._log_filters(
+                filters, f"超时但已显示未招生({message})", school_label
+            )
+            return True, "", "", filters
+
         self._log_filters(filters, f"{field_name}值未就绪", school_label)
         return False, "load", f"{field_name}值为空", filters
 
-    async def _wait_for_scoreline_filters(self, scoreline, school_label):
-        province_ready, province_error_type, province_error, filters = (
-            await self._wait_for_filter_value(
-                scoreline,
-                "省份",
-                self.required_filter_values["省份"],
-                school_label,
-            )
-        )
-        if not province_ready:
-            return False, province_error_type, province_error, filters
+    async def _wait_for_scoreline_filters(
+        self, page, scoreline, school_label, worker_id=0
+    ):
+        is_no_enrollment, message = await self._detect_no_enrollment_state(scoreline)
+        if is_no_enrollment:
+            return True, "no_enrollment", message, {}
 
-        year_ready, year_error_type, year_error, filters = (
-            await self._wait_for_filter_value(
-                scoreline,
-                "年份",
-                self.required_filter_values["年份"],
-                school_label,
-            )
-        )
-        if not year_ready:
-            return False, year_error_type, year_error, filters
+        for attempt in range(2):
+            await self._dismiss_blocking_modals(page, school_label, worker_id)
 
-        for field_name in VALUE_ONLY_FILTERS:
-            value_ready, value_error_type, value_error, filters = (
-                await self._wait_for_filter_has_value(
-                    scoreline, field_name, school_label
+            province_ready, province_error_type, province_error, filters = (
+                await self._wait_for_filter_value(
+                    page,
+                    scoreline,
+                    "省份",
+                    self.required_filter_values["省份"],
+                    school_label,
+                    worker_id,
                 )
             )
-            if not value_ready:
+            if not province_ready:
+                if attempt == 0 and province_error_type == "load":
+                    continue
+                return False, province_error_type, province_error, filters
+
+            year_ready, year_error_type, year_error, filters = (
+                await self._wait_for_filter_value(
+                    page,
+                    scoreline,
+                    "年份",
+                    self.required_filter_values["年份"],
+                    school_label,
+                    worker_id,
+                )
+            )
+            if not year_ready:
+                if attempt == 0 and year_error_type == "load":
+                    continue
+                return False, year_error_type, year_error, filters
+
+            for field_name in VALUE_ONLY_FILTERS:
+                value_ready, value_error_type, value_error, filters = (
+                    await self._wait_for_filter_has_value(
+                        page, scoreline, field_name, school_label, worker_id
+                    )
+                )
+                if not value_ready:
+                    if attempt == 0 and value_error_type == "load":
+                        break
+                    return False, value_error_type, value_error, filters
+            else:
+                filters = await self._get_scoreline_filters(scoreline)
+                self._log_filters(filters, "筛选就绪", school_label)
+                return True, "", "", filters
+
+            if attempt == 1:
                 return False, value_error_type, value_error, filters
 
         filters = await self._get_scoreline_filters(scoreline)
-        self._log_filters(filters, "筛选就绪", school_label)
-        return True, "", "", filters
+        return False, "load", "筛选未就绪", filters
 
-    async def _get_pagination_page_numbers(self, scoreline):
-        page_items = scoreline.locator(".ant-pagination-item")
+    async def _resolve_pagination_box(self, scoreline):
+        pagination_box = scoreline.locator(PAGINATION_BOX_SELECTOR).first
+        try:
+            if await pagination_box.count() > 0 and await pagination_box.is_visible():
+                return pagination_box
+        except Exception:
+            pass
+
+        pagination_root = scoreline.locator(".ant-pagination").first
+        try:
+            if await pagination_root.count() > 0 and await pagination_root.is_visible():
+                return pagination_root
+        except Exception:
+            pass
+
+        return None
+
+    async def _get_pagination_summary(self, scoreline):
+        pagination_box = await self._resolve_pagination_box(scoreline)
+        if pagination_box is None:
+            return {
+                "visible_page_count": 1,
+                "has_next_page": False,
+                "active_page": 1,
+            }
+
+        page_items = pagination_box.locator(PAGINATION_ITEM_SELECTOR)
         page_count = await page_items.count()
-        page_numbers = []
-
+        active_page = 1
         for index in range(page_count):
-            title = await page_items.nth(index).get_attribute("title")
-            if title and str(title).isdigit():
-                page_numbers.append(int(title))
+            item = page_items.nth(index)
+            class_name = (await item.get_attribute("class")) or ""
+            if "ant-pagination-item-active" in class_name:
+                title = await item.get_attribute("title")
+                if title and str(title).isdigit():
+                    active_page = int(title)
+                break
 
-        return sorted(set(page_numbers)) if page_numbers else [1]
-
-    async def _go_to_page(self, scoreline, page_number):
-        active_item = scoreline.locator(
-            f".ant-pagination-item-{page_number}.ant-pagination-item-active"
+        next_btn = pagination_box.locator(PAGINATION_NEXT_SELECTOR).first
+        has_next_page = (
+            await next_btn.count() > 0 and await next_btn.is_visible()
         )
-        if await active_item.count() > 0:
-            return True
 
-        page_item = scoreline.locator(f".ant-pagination-item-{page_number}")
-        if await page_item.count() == 0:
+        return {
+            "visible_page_count": max(page_count, 1),
+            "has_next_page": has_next_page,
+            "active_page": active_page,
+        }
+
+    async def _has_next_page(self, scoreline):
+        summary = await self._get_pagination_summary(scoreline)
+        return summary["has_next_page"]
+
+    async def _click_next_page(self, scoreline, school_label="", worker_id=0):
+        await self._dismiss_blocking_modals(
+            scoreline.page, school_label, worker_id
+        )
+
+        pagination_box = await self._resolve_pagination_box(scoreline)
+        if pagination_box is None:
+            return False
+
+        next_btn = pagination_box.locator(PAGINATION_NEXT_SELECTOR).first
+        if await next_btn.count() == 0 or not await next_btn.is_visible():
             return False
 
         previous_fingerprint = await self._get_table_fingerprint(scoreline)
-        await page_item.locator("a").click()
+        await next_btn.click()
+        await self._dismiss_blocking_modals(
+            scoreline.page, school_label, worker_id
+        )
         return await self._wait_for_table_change(
             scoreline, previous_fingerprint, PAGE_CHANGE_TIMEOUT_MS
         )
@@ -669,7 +1113,7 @@ class GaokaoScorelineScraper:
         filters,
         school_id,
         school_name,
-        page_school_name,
+        school_profile,
     ):
         remark = parsed_row["remark"]
         major_display = merge_major_with_remark(parsed_row["major_name"], remark)
@@ -677,7 +1121,11 @@ class GaokaoScorelineScraper:
         return [
             school_id,
             school_name,
-            page_school_name,
+            school_profile.get("page_school_name", ""),
+            school_profile.get("page_address", ""),
+            school_profile.get("nature", ""),
+            school_profile.get("school_type", ""),
+            school_profile.get("department", ""),
             filters.get("省份", ""),
             filters.get("批次", ""),
             filters.get("科类", ""),
@@ -696,29 +1144,53 @@ class GaokaoScorelineScraper:
         filters,
         school_id,
         school_name,
-        page_school_name,
+        school_profile,
+        school_label="",
+        worker_id=0,
     ):
-        deadline = time.monotonic() + TABLE_READY_TIMEOUT_MS / 1000
-        while time.monotonic() < deadline:
-            if await self._has_table_rows(scoreline):
-                break
-            await asyncio.sleep(NO_DATA_SETTLE_SEC)
-        else:
-            return []
+        content_state, content_message = await self._wait_for_scoreline_content(
+            scoreline
+        )
+        if content_state == "no_enrollment":
+            print(
+                f"[W{worker_id}] 【本省未招生】检测到空状态提示："
+                f"{content_message} [{school_label}]"
+            )
+            return [], content_message
 
-        page_numbers = await self._get_pagination_page_numbers(scoreline)
+        if content_state == "timeout":
+            is_no_enrollment, message = await self._detect_no_enrollment_state(
+                scoreline
+            )
+            if is_no_enrollment:
+                print(
+                    f"[W{worker_id}] 【本省未招生】检测到空状态提示："
+                    f"{message} [{school_label}]"
+                )
+                return [], message
+            return [], ""
+
+        pagination_summary = await self._get_pagination_summary(scoreline)
+        print(
+            f"[W{worker_id}] 【分页】筛选 {filters.get('省份', '')}/"
+            f"{filters.get('年份', '')}/{filters.get('批次', '')}/"
+            f"{filters.get('科类', '')} | 当前第 "
+            f"{pagination_summary['active_page']} 页 | "
+            f"可见页码 {pagination_summary['visible_page_count']} 个 | "
+            f"{'有下一页' if pagination_summary['has_next_page'] else '仅单页'} "
+            f"[{school_label}]"
+        )
+
         result_rows = []
+        page_index = 1
 
-        for page_number in page_numbers:
-            if page_number != 1:
-                moved = await self._go_to_page(scoreline, page_number)
-                if not moved:
-                    print(
-                        f"【警告】第 {page_number} 页切换失败，"
-                        f"尝试继续解析当前页"
-                    )
-
+        while page_index <= MAX_PAGINATION_PAGES:
             parsed_rows = await self._scrape_current_table_rows(scoreline)
+            print(
+                f"[W{worker_id}] 【分页】第 {page_index} 页解析 "
+                f"{len(parsed_rows)} 条专业 [{school_label}]"
+            )
+
             for parsed_row in parsed_rows:
                 result_rows.append(
                     self._build_result_row(
@@ -726,19 +1198,73 @@ class GaokaoScorelineScraper:
                         filters,
                         school_id,
                         school_name,
-                        page_school_name,
+                        school_profile,
                     )
                 )
 
-        return result_rows
+            if not await self._has_next_page(scoreline):
+                break
 
-    async def _get_page_school_name(self, page, timeout=5000):
-        name_locator = page.locator(SCHOOL_NAME_SELECTOR)
+            print(
+                f"[W{worker_id}] 【分页】第 {page_index} 页完成，"
+                f"点击下一页... [{school_label}]"
+            )
+            moved = await self._click_next_page(scoreline, school_label, worker_id)
+            if not moved:
+                print(
+                    f"[W{worker_id}] 【警告】下一页切换失败或表格未变化，"
+                    f"停止翻页 [{school_label}]"
+                )
+                break
+
+            page_index += 1
+
+        if page_index > 1 or pagination_summary["has_next_page"]:
+            print(
+                f"[W{worker_id}] 【分页】翻页结束，共抓取 {page_index} 页，"
+                f"累计 {len(result_rows)} 条专业 [{school_label}]"
+            )
+
+        return result_rows, ""
+
+    async def _get_page_school_profile(
+        self, page, school_label="", worker_id=0, timeout=SCHOOL_PROFILE_TIMEOUT_MS
+    ):
+        await self._dismiss_blocking_modals(page, school_label, worker_id)
+
+        info = page.locator(SCHOOL_INFO_SELECTOR).first
+        name_locator = page.locator(SCHOOL_NAME_SELECTOR).first
+
         try:
-            await name_locator.first.wait_for(state="visible", timeout=timeout)
+            await name_locator.wait_for(state="visible", timeout=timeout)
         except PlaywrightTimeoutError:
             return None
-        return (await name_locator.first.inner_text()).strip()
+
+        name = (await name_locator.inner_text()).strip()
+        if not name:
+            return None
+
+        address = ""
+        if await info.count() > 0:
+            address_locator = info.locator(SCHOOL_ADDRESS_SELECTOR).first
+            if await address_locator.count() > 0:
+                address = (await address_locator.inner_text()).strip()
+
+            core_tags = []
+            core_locator = info.locator(SCHOOL_CORE_TAGS_SELECTOR)
+            core_count = await core_locator.count()
+            for index in range(core_count):
+                tag_text = (await core_locator.nth(index).inner_text()).strip()
+                if tag_text:
+                    core_tags.append(tag_text)
+        else:
+            core_tags = []
+
+        return {
+            "name": name,
+            "address": address,
+            "parsed_core": self._parse_page_core_tags(core_tags),
+        }
 
     async def _scrape_school(self, page, row_index, school_meta, worker_id):
         school_id = school_meta["school_id"]
@@ -753,6 +1279,7 @@ class GaokaoScorelineScraper:
             await page.bring_to_front()
             await asyncio.sleep(random.uniform(0.2, 0.5))
             await page.goto(url, wait_until="domcontentloaded")
+            await self._dismiss_blocking_modals(page, school_label, worker_id)
 
             current_url = page.url.split("?")[0].rstrip("/")
             expected_url = url.rstrip("/")
@@ -764,14 +1291,18 @@ class GaokaoScorelineScraper:
                 result_text = "无效"
                 return
 
-            page_school_name = await self._get_page_school_name(page)
-            if page_school_name is None:
+            page_profile = await self._get_page_school_profile(
+                page, school_label, worker_id
+            )
+            if page_profile is None:
                 print(
-                    f"[W{worker_id}] 【失败】未读取到院校名称: {school_label}"
+                    f"[W{worker_id}] 【失败】未读取到院校标题信息: {school_label}"
                 )
                 self._save_status(row_index, "失败-未加载", "未找到院校标题")
                 result_text = "失败-未加载"
                 return
+
+            school_profile = self._merge_school_profile(page_profile, school_meta)
 
             scoreline = await self._wait_for_scoreline_ready(
                 page, school_label, worker_id
@@ -781,8 +1312,22 @@ class GaokaoScorelineScraper:
                 result_text = "失败-未加载"
                 return
 
+            is_no_enrollment, no_enrollment_message = (
+                await self._detect_no_enrollment_state(scoreline)
+            )
+            if is_no_enrollment:
+                print(
+                    f"[W{worker_id}] 【本省未招生】{no_enrollment_message}: "
+                    f"{school_label}"
+                )
+                self._save_status(row_index, "本省未招生", no_enrollment_message)
+                result_text = "本省未招生"
+                return
+
             filters_ready, error_type, filter_error, filters = (
-                await self._wait_for_scoreline_filters(scoreline, school_label)
+                await self._wait_for_scoreline_filters(
+                    page, scoreline, school_label, worker_id
+                )
             )
             if not filters_ready:
                 if error_type == "invalid":
@@ -827,15 +1372,19 @@ class GaokaoScorelineScraper:
             print(
                 f"[W{worker_id}] 【抓取】{filters['省份']} {filters['年份']} "
                 f"{filters['批次']} {filters['科类']} | "
-                f"页面院校: {page_school_name} | {school_label}"
+                f"页面院校: {school_profile['page_school_name']} | "
+                f"{school_profile['nature']}/{school_profile['school_type']}/"
+                f"{school_profile['department']} | {school_label}"
             )
 
-            result_rows = await self._scrape_all_pages(
+            result_rows, no_enrollment_message = await self._scrape_all_pages(
                 scoreline,
                 filters,
                 school_meta["school_id"],
                 school_meta["school_name"],
-                page_school_name,
+                school_profile,
+                school_label,
+                worker_id,
             )
             self._append_result_rows(result_rows)
 
@@ -846,6 +1395,14 @@ class GaokaoScorelineScraper:
                     f"[W{worker_id}] 【成功】{school_label} "
                     f"共 {len(result_rows)} 条专业"
                 )
+            elif no_enrollment_message:
+                print(
+                    f"[W{worker_id}] 【本省未招生】"
+                    f"{self.target_province}/{self.target_year} "
+                    f"{no_enrollment_message}: {school_label}"
+                )
+                self._save_status(row_index, "本省未招生", no_enrollment_message)
+                result_text = "本省未招生"
             else:
                 print(
                     f"[W{worker_id}] 【本省未招生】"
@@ -926,20 +1483,11 @@ class GaokaoScorelineScraper:
                     no_enrollment_count += 1
                 continue
 
-            school_id = self._normalize_cell_value(row.get(self.id_column, ""))
-            if not school_id:
+            school_meta = self._get_school_meta(index)
+            if not school_meta["school_id"]:
                 continue
 
-            school_name = self._normalize_cell_value(row.get("院校名称", ""))
-            pending_tasks.append(
-                (
-                    index,
-                    {
-                        "school_id": school_id,
-                        "school_name": school_name,
-                    },
-                )
-            )
+            pending_tasks.append((index, school_meta))
 
         self._total_pending = len(pending_tasks)
         self._skip_count = skip_count
@@ -951,7 +1499,7 @@ class GaokaoScorelineScraper:
                 f"没有待爬取的院校。"
                 f"总计 {self._total_schools} 所，已成功 {success_count}，"
                 f"无效 {invalid_count}，本省未招生 {no_enrollment_count}，"
-                f"跳过 {skip_count} 所。"
+                f"跳过 {invalid_count + no_enrollment_count} 所。"
             )
             return
 
@@ -1046,8 +1594,8 @@ class GaokaoScorelineScraper:
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-    school_source_path = os.path.join(current_dir, "掌上高考-id_院校_map表.csv")
-    status_save_path = os.path.join(current_dir, "掌上高考-id_院校_map表.csv")
+    school_source_path = os.path.join(current_dir, "普通高校_带id.csv")
+    status_save_path = os.path.join(current_dir, "普通高校_带id.csv")
 
     scraper = GaokaoScorelineScraper(
         school_source_path=school_source_path,
