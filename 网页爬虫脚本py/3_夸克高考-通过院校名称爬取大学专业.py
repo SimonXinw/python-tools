@@ -13,7 +13,7 @@ from playwright.async_api import (
 )
 
 # 爬取目标（修改此处即可切换省份/年份）
-TARGET_PROVINCE = "安徽"
+TARGET_PROVINCE = "江苏"
 TARGET_YEAR = "2025"
 TARGET_BATCH = "本科批"
 TARGET_GENRE = "首选物理"
@@ -55,6 +55,9 @@ SOURCE_EXTRA_COLUMN_MAP = {
     "层次": "层次",
     "性质": "性质",
 }
+
+# 页面 title 模块抓取字段（仅用于结果表，不写回状态表）
+HEADER_INFO_FIELDS = ("层次", "类型", "性质")
 
 CSV_READ_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "gb18030")
 
@@ -313,7 +316,7 @@ class QuarkMajorsScraper:
             text = text[:-2]
         return text
 
-    def _get_school_info(self, row_index):
+    def _get_school_info(self, row_index, header_info=None):
         row = self.df.loc[row_index]
         school_info = {
             "主管部门": self._normalize_cell_value(row.get("主管部门", "")),
@@ -322,6 +325,13 @@ class QuarkMajorsScraper:
             school_info[result_col] = self._normalize_cell_value(
                 row.get(source_col, "")
             )
+
+        # 层次/类型/性质：页面抓取优先，未抓到则沿用源表原值
+        for field_name in HEADER_INFO_FIELDS:
+            scraped_value = str((header_info or {}).get(field_name, "")).strip()
+            if scraped_value:
+                school_info[field_name] = scraped_value
+
         return school_info
 
     def _create_empty_result_file(self):
@@ -512,11 +522,50 @@ class QuarkMajorsScraper:
 
     async def _get_page_school_name(self, page, timeout=5000):
         name_locator = page.locator(".university-logo-left .qk-title-text em")
+        fallback_locator = page.locator(
+            ".university-logo-left .qk-title-text"
+        ).first
+
         try:
             await name_locator.first.wait_for(state="visible", timeout=timeout)
+            return (await name_locator.first.inner_text()).strip()
+        except PlaywrightTimeoutError:
+            pass
+
+        try:
+            await fallback_locator.wait_for(state="visible", timeout=timeout)
         except PlaywrightTimeoutError:
             return None
-        return (await name_locator.first.inner_text()).strip()
+
+        return (await fallback_locator.inner_text()).strip()
+
+    async def _get_page_school_header_info(self, page, timeout=5000):
+        """
+        从 title 模块 .university-tags-pc-top 抓取院校标签：
+        span[0]=省份, span[1]=层次, span[2]=类型, span[3]=性质
+        仅返回抓到的非空字段。
+        """
+        tags_locator = page.locator(".university-tags-pc-top span")
+        try:
+            await tags_locator.first.wait_for(state="visible", timeout=timeout)
+        except PlaywrightTimeoutError:
+            return {}
+
+        span_count = await tags_locator.count()
+        if span_count < 2:
+            return {}
+
+        header_fields = HEADER_INFO_FIELDS
+        header_info = {}
+
+        for index, field_name in enumerate(header_fields, start=1):
+            if index >= span_count:
+                break
+            text = (await tags_locator.nth(index).inner_text()).strip()
+            if text:
+                header_info[field_name] = text
+
+        return header_info
 
     async def _get_card_filters(self, card):
         genre_text = await self._get_locator_text(
@@ -880,6 +929,7 @@ class QuarkMajorsScraper:
     async def _scrape_school(self, page, row_index, school_name, worker_id):
         url = self._build_url(school_name)
         result_text = "失败"
+        header_info = {}
 
         try:
             await page.bring_to_front()
@@ -889,12 +939,22 @@ class QuarkMajorsScraper:
             page_school_name = await self._get_page_school_name(page)
             if page_school_name is None:
                 print(
-                    f"[W{worker_id}] 【失败】未等到院校名 em 元素: {school_name}"
+                    f"[W{worker_id}] 【失败】未等到院校名元素: {school_name}"
                 )
                 await asyncio.sleep(3)
                 self._save_status(row_index, "失败-未加载")
                 result_text = "失败-未加载"
                 return
+
+            header_info = await self._get_page_school_header_info(page)
+            if header_info:
+                print(
+                    f"[W{worker_id}] 【院校标签】"
+                    f"层次={header_info.get('层次', '')}，"
+                    f"类型={header_info.get('类型', '')}，"
+                    f"性质={header_info.get('性质', '')} "
+                    f"[{school_name}]"
+                )
 
             if page_school_name == "undefined":
                 print(
@@ -1005,7 +1065,7 @@ class QuarkMajorsScraper:
                 result_text = "本省未招生"
                 return
 
-            school_info = self._get_school_info(row_index)
+            school_info = self._get_school_info(row_index, header_info)
             results = []
             result_rows = []
 
