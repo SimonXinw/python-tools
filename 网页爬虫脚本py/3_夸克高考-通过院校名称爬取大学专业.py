@@ -13,7 +13,7 @@ from playwright.async_api import (
 )
 
 # 爬取目标（修改此处即可切换省份/年份）
-TARGET_PROVINCE = "江苏"
+TARGET_PROVINCE = "四川"
 TARGET_YEAR = "2025"
 TARGET_BATCH = "本科批"
 TARGET_GENRE = "首选物理"
